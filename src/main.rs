@@ -490,14 +490,62 @@ fn parse_links(buf: &[u8], c: &C1, out: &mut Vec<(u64, u64)>) {
     }
 }
 
+/// LSD radix sort of (key, payload) pairs by key, 8 bits per pass; passes in which every key has
+/// the same digit are skipped.
+fn radix_sort_by_key(v: &mut Vec<(u64, u32)>) {
+    let n = v.len();
+    let mut tmp: Vec<(u64, u32)> = vec![(0, 0); n];
+    for pass in 0..8 {
+        let shift = 8 * pass;
+        let mut count = [0usize; 256];
+        for &(k, _) in v.iter() {
+            count[((k >> shift) & 0xFF) as usize] += 1;
+        }
+        if count.iter().any(|&c| c == n) {
+            continue; // every key has the same digit here
+        }
+        let mut sum = 0;
+        for c in count.iter_mut() {
+            let x = *c;
+            *c = sum;
+            sum += x;
+        }
+        for &(k, p) in v.iter() {
+            let d = ((k >> shift) & 0xFF) as usize;
+            tmp[count[d]] = (k, p);
+            count[d] += 1;
+        }
+        std::mem::swap(v, &mut tmp);
+    }
+}
+
 /// R18-R21: union-find over all link lines; each person is named by the byte-wise smallest ID.
 /// Returns ID key -> person key for linked IDs that are not their own person's name.
+///
+/// Dense IDs are assigned in key order by sorting all endpoints (cache-friendly, unlike hashing
+/// each endpoint). Unions always hang the larger root under the smaller, so every root is its
+/// component's smallest ID, and for packed keys numeric order is byte order (R20): the root's
+/// key is the person's name. Fallback (interned) keys do not sort by bytes, so components that
+/// hold any are fixed up with explicit byte comparisons.
 fn build_person_map(pairs: &[Vec<(u64, u64)>], interner: &Interner) -> Map<u64> {
-    let total: usize = pairs.iter().map(|p| p.len()).sum();
-    let mut index: Map<u32> = Map::with_capacity(total + 16);
-    let mut keys: Vec<u64> = Vec::with_capacity(total);
-    let mut parent: Vec<u32> = Vec::with_capacity(total);
-    let mut size: Vec<u32> = Vec::with_capacity(total);
+    let m: usize = pairs.iter().map(|p| p.len()).sum();
+    let mut ends: Vec<(u64, u32)> = Vec::with_capacity(2 * m);
+    for (i, &(a, b)) in pairs.iter().flatten().enumerate() {
+        ends.push((a, 2 * i as u32));
+        ends.push((b, 2 * i as u32 + 1));
+    }
+    radix_sort_by_key(&mut ends);
+    let mut ids = vec![0u32; 2 * m]; // endpoint slot -> dense ID
+    let mut keys: Vec<u64> = Vec::with_capacity(m);
+    for &(k, slot) in &ends {
+        if keys.last() != Some(&k) {
+            keys.push(k);
+        }
+        ids[slot as usize] = (keys.len() - 1) as u32;
+    }
+    drop(ends);
+    let n = keys.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let p = parent[x as usize];
@@ -506,38 +554,26 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], interner: &Interner) -> Map<u64> 
         }
         x
     }
-    // Random probes dominate: prefetch the map slots of the pair AHEAD positions on.
-    let flat: Vec<&(u64, u64)> = pairs.iter().flatten().collect();
-    for (n, &&(a, b)) in flat.iter().enumerate() {
-        if let Some(&&(x, y)) = flat.get(n + AHEAD) {
-            index.prefetch(x);
-            index.prefetch(y);
-        }
-        let mut id = |k: u64| -> u32 {
-            let (i, inserted) = index.get_or_insert_with(k, || keys.len() as u32);
-            if inserted {
-                keys.push(k);
-                parent.push(i);
-                size.push(1);
-            }
-            i
-        };
-        let (ia, ib) = (id(a), id(b));
-        let (mut ra, mut rb) = (find(&mut parent, ia), find(&mut parent, ib));
+    for e in ids.chunks_exact(2) {
+        let (ra, rb) = (find(&mut parent, e[0]), find(&mut parent, e[1]));
         if ra != rb {
-            if size[ra as usize] < size[rb as usize] {
-                std::mem::swap(&mut ra, &mut rb);
-            }
-            parent[rb as usize] = ra;
-            size[ra as usize] += size[rb as usize];
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            parent[hi as usize] = lo; // the root stays the smallest ID
         }
     }
-    let n = keys.len();
-    let mut name = vec![0u64; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        if name[r] == 0 || interner.cmp(keys[i], name[r]) == std::cmp::Ordering::Less {
-            name[r] = keys[i];
+    drop(ids);
+    // name[root]: the root's key, which is the byte-wise smallest unless fallback keys are involved.
+    let root: Vec<u32> = (0..n as u32).map(|i| find(&mut parent, i)).collect();
+    let mut name: Vec<u64> = (0..n).map(|i| keys[root[i] as usize]).collect();
+    if keys.iter().any(|&k| k & ids::FALLBACK != 0) {
+        for i in 0..n {
+            let r = root[i] as usize;
+            if interner.cmp(keys[i], name[r]) == std::cmp::Ordering::Less {
+                name[r] = keys[i];
+            }
+        }
+        for i in 0..n {
+            name[i] = name[root[i] as usize];
         }
     }
     let mut map: Map<u64> = Map::with_capacity(n);
@@ -545,7 +581,7 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], interner: &Interner) -> Map<u64> 
         if let Some(&ahead) = keys.get(i + AHEAD) {
             map.prefetch(ahead);
         }
-        let person = name[find(&mut parent, i as u32) as usize];
+        let person = name[i];
         if person != keys[i] {
             map.insert(keys[i], person);
         }
