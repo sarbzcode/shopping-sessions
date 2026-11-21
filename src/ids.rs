@@ -26,7 +26,8 @@ const fn build_code() -> [u8; 256] {
     }
     t
 }
-static CODE: [u8; 256] = build_code();
+/// 6-bit code of each byte that packed keys allow ([0-9A-Za-z], in ASCII order from 1), else 0.
+pub static CODE: [u8; 256] = build_code();
 
 const fn build_chars() -> [u8; 64] {
     let mut t = [0u8; 64];

@@ -9,6 +9,7 @@
 //!          with a sliding 7-day click window (R32-R35), aggregate both tables.
 //! Stage 4  write the Parquet files in parallel.
 
+mod fast;
 mod ids;
 mod parquet;
 mod parse;
@@ -22,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use ids::{Interner, Names};
-use parse::{for_each_line, parse_price, parse_ts, Lookup, DAY_MS};
+use parse::{for_each_line, for_each_line_slow, parse_price, parse_ts, Lookup, DAY_MS};
 use table::{mix, Map};
 
 const SESSION_GAP: i64 = 1_800_000; // R26: a gap over 30 min starts a new session
@@ -77,18 +78,21 @@ type Res<T> = Result<T, String>;
 // Records
 // ---------------------------------------------------------------------------------------------
 
-/// One parsed copy of an event (before dedup). `valid` covers R24 and R25 for this copy.
-#[derive(Clone, Copy)]
+// Every `ts` below is a u32 millisecond offset from `base = window_start - 7 days`, the start of
+// the click window (R17); events are at offsets [7 d, 7 d + window). Windows up to 42 days fit.
+// `pc` packs a purchase's price (bits 0..24; 10,000,000 < 2^24) and category (bits 24..32);
+// it is 0 for views and carts.
+
+/// One parsed copy of an event (before dedup). `ukey != 0` means this copy is valid (R24, R25):
+/// a valid copy always has a non-empty user_id, and no ID key is 0.
+#[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(C)]
 struct Ev1 {
     ekey: u64,
     ingest: i64,
     ukey: u64,
-    ts: i64,
-    price: u32, // > 0 only for a valid purchase
-    cat: u16,
-    valid: u8,
-    _pad: u8,
+    ts: u32,
+    pc: u32,
 }
 
 /// A surviving event, keyed by its person.
@@ -96,21 +100,28 @@ struct Ev1 {
 #[repr(C)]
 struct Ev2 {
     person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    _pad: u16,
+    ts: u32,
+    pc: u32,
+}
+
+#[inline(always)]
+fn pc_price(pc: u32) -> u32 {
+    pc & 0x00FF_FFFF
+}
+
+#[inline(always)]
+fn pc_cat(pc: u32) -> u16 {
+    (pc >> 24) as u16
 }
 
 /// A valid click; `key` is the user key until stage 2 and the person key after.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
 #[repr(C)]
 struct Ck {
     key: u64,
-    ts: i64,
     ckey: u64,
+    ts: u32,
     camp: u32,
-    _pad: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -215,8 +226,9 @@ fn load_products(path: &Path) -> Res<Catalog> {
     for (pid, cat) in pending {
         lookup.insert_first(&pid, cat.unwrap_or(unknown) as u32);
     }
-    if names.len() >= NO_CATEGORY as usize {
-        return Err("too many categories".into());
+    if names.len() > 256 {
+        // Records keep a category in 8 bits; the generator writes 20 categories.
+        return Err(format!("{} categories in products.csv; at most 255 plus `unknown` are supported", names.len() - 1));
     }
     let mut order: Vec<usize> = (0..names.len()).collect();
     order.sort_by(|&a, &b| names[a].cmp(&names[b]));
@@ -292,6 +304,7 @@ struct C1<'a> {
     campaigns: &'a Campaigns,
     ws: i64,
     we: i64,
+    base: i64,
     p1_shift: u32,
     p1: usize,
     part_cap: usize,
@@ -303,61 +316,167 @@ struct S1 {
     prof: Prof,
 }
 
-fn parse_events(buf: &[u8], c: &C1, parts: &mut [Vec<Ev1>]) {
-    let (ws, we) = (c.ws, c.we);
-    for_each_line::<7>(buf, |f| {
-        // R22: drop lines with an empty event_id (malformed lines never reach here).
+/// R24/R25 on one parsed copy of an event. `kind`: 0 view, 1 cart, 2 purchase, 3 anything else.
+/// The copy is kept even when invalid: dedup (stage 2, R23) decides which copy counts.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn build_event(c: &C1, ekey: u64, ukey: u64, ts: Option<i64>, ingest: i64, kind: u8, product: &[u8], price: &[u8]) -> Ev1 {
+    let mut valid = ukey != 0 && !product.is_empty() && kind <= 2;
+    let t = match ts {
+        Some(t) if t >= c.ws && t < c.we => t, // R16
+        _ => {
+            valid = false;
+            0
+        }
+    };
+    let mut pc = 0u32;
+    if valid && kind == 2 {
+        match parse_price(price) {
+            Some(p) => {
+                let cat = c.products.lookup.get(product).unwrap_or(c.products.unknown as u32); // R28
+                pc = p | cat << 24;
+            }
+            None => valid = false,
+        }
+    }
+    // R25: late if ingest_ts - ts is over 24 h (an ingest before ts is fine). R15: an unparseable
+    // ingest_ts (i64::MAX) never wins dedup and is never valid (ambiguity 6).
+    valid &= ingest != i64::MAX && ingest - t <= LATE_MS;
+    if valid {
+        Ev1 { ekey, ingest, ukey, ts: (t - c.base) as u32, pc }
+    } else {
+        Ev1 { ekey, ingest, ukey: 0, ts: 0, pc: 0 }
+    }
+}
+
+#[inline(always)]
+fn push_event(c: &C1, parts: &mut [Vec<Ev1>], ev: Ev1) {
+    parts[(mix(ev.ekey) >> c.p1_shift) as usize].push(ev);
+}
+
+/// The generic path for event lines (R22: malformed lines and empty event_id are dropped).
+#[inline(never)]
+fn slow_events(buf: &[u8], c: &C1, parts: &mut [Vec<Ev1>]) {
+    for_each_line_slow::<7>(buf, |f| {
         if f[0].is_empty() {
             return;
         }
         let ekey = c.interner.key(f[0]);
-        // R15: ingest_ts is always valid F1; an unparseable one never wins dedup (ambiguity 6).
-        let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-        // R24 on this copy; dedup (stage 2) decides which copy counts.
-        let mut valid = !f[1].is_empty() && !f[5].is_empty();
-        let ts = match parse_ts(f[2]) {
-            Some(t) if t >= ws && t < we => t, // R16
-            _ => {
-                valid = false;
-                0
-            }
+        let ukey = if f[1].is_empty() { 0 } else { c.interner.key(f[1]) };
+        let kind = match f[4] {
+            b"view" => 0,
+            b"cart" => 1,
+            b"purchase" => 2,
+            _ => 3,
         };
-        let ty = f[4];
-        let purchase = ty == b"purchase";
-        valid &= purchase || ty == b"view" || ty == b"cart";
-        let (mut price, mut cat) = (0u32, NO_CATEGORY);
-        if valid && purchase {
-            match parse_price(f[6]) {
-                Some(p) => {
-                    price = p;
-                    cat = c.products.lookup.get(f[5]).map_or(c.products.unknown, |x| x as u16); // R28
+        let ev = build_event(c, ekey, ukey, parse_ts(f[2]), parse_ts(f[3]).unwrap_or(i64::MAX), kind, f[5], f[6]);
+        push_event(c, parts, ev);
+    });
+}
+
+fn parse_events(buf: &[u8], c: &C1, parts: &mut [Vec<Ev1>]) {
+    let len = buf.len();
+    let mut p = 0;
+    while p + fast::SLACK <= len {
+        match fast::event_line(buf, p) {
+            Some((l, next)) => {
+                if l.ekey != 0 {
+                    let ev = build_event(c, l.ekey, l.ukey, Some(l.ts), l.ingest, l.kind, &buf[l.product.0..l.product.1], &buf[l.price.0..l.price.1]);
+                    push_event(c, parts, ev);
                 }
-                None => valid = false,
+                p = next;
+            }
+            None => {
+                let le = fast::line_end(buf, p);
+                slow_events(&buf[p..le], c, parts);
+                p = le + 1;
             }
         }
-        // R25: late if ingest_ts - ts is over 24 h (an ingest before ts is fine).
-        valid &= ingest != i64::MAX && ingest - ts <= LATE_MS;
-        let ukey = if valid { c.interner.key(f[1]) } else { 0 };
-        let p = (mix(ekey) >> c.p1_shift) as usize;
-        parts[p].push(Ev1 { ekey, ingest, ukey, ts, price, cat, valid: valid as u8, _pad: 0 });
+    }
+    if p < len {
+        slow_events(&buf[p..], c, parts);
+    }
+}
+
+/// R29-R31 on one click. R30 (dedup) is skipped: copies are identical, so they cannot change a
+/// credit or an assist set.
+#[inline(always)]
+fn build_click(c: &C1, ckey: u64, ukey: u64, campaign: &[u8], ts: Option<i64>) -> Option<Ck> {
+    if ckey == 0 || ukey == 0 {
+        return None; // R29 empty click_id, R31 empty user_id
+    }
+    let camp = c.campaigns.lookup.get(campaign)?; // R31 campaign in campaigns.csv
+    let ts = ts?;
+    if ts < c.base || ts >= c.we {
+        return None; // R17: base is window_start - 7 days
+    }
+    Some(Ck { key: ukey, ckey, ts: (ts - c.base) as u32, camp })
+}
+
+#[inline(never)]
+fn slow_clicks(buf: &[u8], c: &C1, out: &mut Vec<Ck>) {
+    for_each_line_slow::<4>(buf, |f| {
+        let ckey = if f[0].is_empty() { 0 } else { c.interner.key(f[0]) };
+        let ukey = if f[1].is_empty() { 0 } else { c.interner.key(f[1]) };
+        if let Some(ck) = build_click(c, ckey, ukey, f[2], parse_ts(f[3])) {
+            out.push(ck);
+        }
     });
 }
 
 fn parse_clicks(buf: &[u8], c: &C1, out: &mut Vec<Ck>) {
-    let (cws, we) = (c.ws - CLICK_REACH, c.we);
-    for_each_line::<4>(buf, |f| {
-        // R29: empty click_id; R31: empty user_id, unknown campaign, bad ts or outside the click window.
-        // R30 (dedup) is skipped: copies are identical, so they cannot change a credit or an assist set.
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
+    let len = buf.len();
+    let mut p = 0;
+    while p + fast::SLACK <= len {
+        match fast::click_line(buf, p) {
+            Some((l, next)) => {
+                if let Some(ck) = build_click(c, l.ckey, l.ukey, &buf[l.campaign.0..l.campaign.1], Some(l.ts)) {
+                    out.push(ck);
+                }
+                p = next;
+            }
+            None => {
+                let le = fast::line_end(buf, p);
+                slow_clicks(&buf[p..le], c, out);
+                p = le + 1;
+            }
         }
-        let Some(camp) = c.campaigns.lookup.get(f[2]) else { return };
-        let Some(ts) = parse_ts(f[3]) else { return };
-        if ts < cws || ts >= we {
-            return;
+    }
+    if p < len {
+        slow_clicks(&buf[p..], c, out);
+    }
+}
+
+#[inline(never)]
+fn slow_links(buf: &[u8], c: &C1, out: &mut Vec<(u64, u64)>) {
+    for_each_line_slow::<2>(buf, |f| {
+        if !f[0].is_empty() && !f[1].is_empty() {
+            out.push((c.interner.key(f[0]), c.interner.key(f[1]))); // R18
         }
-        out.push(Ck { key: c.interner.key(f[1]), ts, ckey: c.interner.key(f[0]), camp, _pad: 0 });
     });
+}
+
+fn parse_links(buf: &[u8], c: &C1, out: &mut Vec<(u64, u64)>) {
+    let len = buf.len();
+    let mut p = 0;
+    while p + fast::SLACK <= len {
+        match fast::link_line(buf, p) {
+            Some(((a, b), next)) => {
+                if a != 0 && b != 0 {
+                    out.push((a, b)); // R18: a line with an empty side is dropped
+                }
+                p = next;
+            }
+            None => {
+                let le = fast::line_end(buf, p);
+                slow_links(&buf[p..le], c, out);
+                p = le + 1;
+            }
+        }
+    }
+    if p < len {
+        slow_links(&buf[p..], c, out);
+    }
 }
 
 /// R18-R21: union-find over all link lines; each person is named by the byte-wise smallest ID.
@@ -376,7 +495,13 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], interner: &Interner) -> Map<u64> 
         }
         x
     }
-    for &(a, b) in pairs.iter().flatten() {
+    // Random probes dominate: prefetch the map slots of the pair AHEAD positions on.
+    let flat: Vec<&(u64, u64)> = pairs.iter().flatten().collect();
+    for (n, &&(a, b)) in flat.iter().enumerate() {
+        if let Some(&&(x, y)) = flat.get(n + AHEAD) {
+            index.prefetch(x);
+            index.prefetch(y);
+        }
         let mut id = |k: u64| -> u32 {
             let (i, inserted) = index.get_or_insert_with(k, || keys.len() as u32);
             if inserted {
@@ -406,6 +531,9 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], interner: &Interner) -> Map<u64> 
     }
     let mut map: Map<u64> = Map::with_capacity(n);
     for i in 0..n {
+        if let Some(&ahead) = keys.get(i + AHEAD) {
+            map.prefetch(ahead);
+        }
         let person = name[find(&mut parent, i as u32) as usize];
         if person != keys[i] {
             map.insert(keys[i], person);
@@ -431,11 +559,7 @@ fn stage1_worker(c: &C1) -> S1 {
         match t.kind {
             Kind::Link => {
                 let mut pairs = Vec::new();
-                for_each_line::<2>(buf, |f| {
-                    if !f[0].is_empty() && !f[1].is_empty() {
-                        pairs.push((c.interner.key(f[0]), c.interner.key(f[1])));
-                    }
-                });
+                parse_links(buf, c, &mut pairs);
                 c.link_pairs.lock().unwrap().push(pairs);
                 if c.links_left.fetch_sub(1, AcqRel) == 1 {
                     let t_uf = Instant::now();
@@ -458,49 +582,50 @@ fn stage1_worker(c: &C1) -> S1 {
 // Stage 2: dedup, person mapping, scatter by person
 // ---------------------------------------------------------------------------------------------
 
+/// Per-partition dedup table holding each event_id's best copy so far.
 struct Dedup {
-    keys: Vec<u64>,
-    ingest: Vec<i64>,
-    refs: Vec<u64>,
+    slots: Vec<Ev1>,
     used: Vec<u32>,
     mask: usize,
 }
 
+const EMPTY_EV1: Ev1 = Ev1 { ekey: 0, ingest: 0, ukey: 0, ts: 0, pc: 0 };
+const AHEAD: usize = 8; // prefetch distance for random probes
+
 impl Dedup {
     fn new() -> Self {
-        Self { keys: Vec::new(), ingest: Vec::new(), refs: Vec::new(), used: Vec::new(), mask: 0 }
+        Self { slots: Vec::new(), used: Vec::new(), mask: 0 }
     }
     fn reset(&mut self, n: usize) {
         let cap = (n.max(8) * 2).next_power_of_two();
-        if cap > self.keys.len() {
-            self.keys = vec![0; cap];
-            self.ingest = vec![0; cap];
-            self.refs = vec![0; cap];
+        if cap > self.slots.len() {
+            self.slots = vec![EMPTY_EV1; cap];
             self.mask = cap - 1;
         } else {
             for &i in &self.used {
-                self.keys[i as usize] = 0;
+                self.slots[i as usize].ekey = 0;
             }
         }
         self.used.clear();
     }
+    #[inline(always)]
+    fn prefetch(&self, ekey: u64) {
+        table::prefetch(&self.slots[mix(ekey) as usize & self.mask]);
+    }
     /// R23: keep the copy with the smallest ingest_ts (equal ones are identical copies).
     #[inline(always)]
-    fn offer(&mut self, k: u64, ingest: i64, r: u64) {
-        let mut i = mix(k) as usize & self.mask;
+    fn offer(&mut self, r: &Ev1) {
+        let mut i = mix(r.ekey) as usize & self.mask;
         loop {
-            let kk = self.keys[i];
-            if kk == 0 {
-                self.keys[i] = k;
-                self.ingest[i] = ingest;
-                self.refs[i] = r;
+            let s = &mut self.slots[i];
+            if s.ekey == 0 {
+                *s = *r;
                 self.used.push(i as u32);
                 return;
             }
-            if kk == k {
-                if ingest < self.ingest[i] {
-                    self.ingest[i] = ingest;
-                    self.refs[i] = r;
+            if s.ekey == r.ekey {
+                if r.ingest < s.ingest {
+                    *s = *r;
                 }
                 return;
             }
@@ -548,27 +673,41 @@ fn stage2_worker(c: &C2) -> S2 {
             let t_dedup = Instant::now();
             let n: usize = c.s1.iter().map(|s| s.ev[p].len()).sum();
             dedup.reset(n);
-            for (t, s) in c.s1.iter().enumerate() {
-                for (j, r) in s.ev[p].iter().enumerate() {
-                    dedup.offer(r.ekey, r.ingest, ((t as u64) << 32) | j as u64);
+            for s in c.s1 {
+                let recs = &s.ev[p];
+                for (j, r) in recs.iter().enumerate() {
+                    if let Some(ahead) = recs.get(j + AHEAD) {
+                        dedup.prefetch(ahead.ekey);
+                    }
+                    dedup.offer(r);
                 }
             }
             out.prof.add(0, t_dedup);
             let t_emit = Instant::now();
-            for &slot in &dedup.used {
-                let r = dedup.refs[slot as usize];
-                let rec = &c.s1[(r >> 32) as usize].ev[p][(r & 0xffff_ffff) as usize];
-                if rec.valid == 0 {
-                    continue; // R23: an invalid kept copy drops the event
+            // Scan the table in slot order (sequential memory), prefetching person-map probes.
+            let slots = &dedup.slots[..];
+            for (k, rec) in slots.iter().enumerate() {
+                if let Some(ahead) = slots.get(k + 2 * AHEAD) {
+                    if ahead.ukey != 0 {
+                        c.pmap.prefetch(ahead.ukey);
+                    }
+                }
+                // Empty slots have ekey 0; R23: an invalid kept copy (ukey 0) drops the event.
+                if rec.ekey == 0 || rec.ukey == 0 {
+                    continue;
                 }
                 let person = person_of(c.pmap, rec.ukey);
                 let q = (mix(person) >> c.p2_shift) as usize;
-                out.ev[q].push(Ev2 { person, ts: rec.ts, price: rec.price, cat: rec.cat, _pad: 0 });
+                out.ev[q].push(Ev2 { person, ts: rec.ts, pc: rec.pc });
             }
             out.prof.add(1, t_emit);
         } else if let Some(&(t, s, e)) = c.click_tasks.get(i - c.p1) {
             let t_ck = Instant::now();
-            for ck in &c.s1[t].ck[s..e] {
+            let cks = &c.s1[t].ck[s..e];
+            for (k, ck) in cks.iter().enumerate() {
+                if let Some(ahead) = cks.get(k + AHEAD) {
+                    c.pmap.prefetch(ahead.key);
+                }
                 let person = person_of(c.pmap, ck.key);
                 let q = (mix(person) >> c.p2_shift) as usize;
                 out.ck[q].push(Ck { key: person, ..*ck });
@@ -589,6 +728,7 @@ struct C3<'a> {
     s2: &'a [S2],
     names: &'a Names,
     cat_rank: &'a [u16],
+    base: i64,
     first_day: i64,
     ndays: usize,
     organic: usize, // campaign index of `organic` (= number of campaigns)
@@ -691,7 +831,7 @@ fn process_person(person: u64, ev: &mut [Ev2], ck: &mut [Ck], c: &C3, w: &mut W3
     while i < n {
         // R26: a session runs while gaps are at most 30 min; equal ts never split.
         let start = ev[i].ts;
-        let day = start.div_euclid(DAY_MS); // R27
+        let day = (c.base + start as i64).div_euclid(DAY_MS); // R27
         if day != day_cur {
             if day_cur != i64::MIN {
                 flush_day(&mut w.rows, person, day_cur, d_sess, d_events, d_rev, &w.cats, c.cat_rank);
@@ -705,14 +845,16 @@ fn process_person(person: u64, ev: &mut [Ev2], ck: &mut [Ck], c: &C3, w: &mut W3
         let mut j = i;
         let mut prev = start;
         let mut rev = 0u64;
-        while j < n && ev[j].ts - prev <= SESSION_GAP {
+        while j < n && ev[j].ts - prev <= SESSION_GAP as u32 {
             let e = ev[j];
             prev = e.ts;
-            if e.price > 0 {
-                rev += e.price as u64;
-                match w.cats.iter_mut().find(|x| x.0 == e.cat) {
-                    Some(x) => x.1 += e.price as u64,
-                    None => w.cats.push((e.cat, e.price as u64)),
+            let price = pc_price(e.pc);
+            if price > 0 {
+                let cat = pc_cat(e.pc);
+                rev += price as u64;
+                match w.cats.iter_mut().find(|x| x.0 == cat) {
+                    Some(x) => x.1 += price as u64,
+                    None => w.cats.push((cat, price as u64)),
                 }
             }
             j += 1;
@@ -726,7 +868,7 @@ fn process_person(person: u64, ev: &mut [Ev2], ck: &mut [Ck], c: &C3, w: &mut W3
             w.win.add(ck[hi].camp);
             hi += 1;
         }
-        while lo < hi && ck[lo].ts < start - CLICK_REACH {
+        while lo < hi && (ck[lo].ts as i64) < start as i64 - CLICK_REACH {
             w.win.remove(ck[lo].camp);
             lo += 1;
         }
@@ -1076,6 +1218,7 @@ fn bench_parse(data: &Path) -> Res<()> {
         campaigns: &campaigns,
         ws,
         we,
+        base: ws - CLICK_REACH,
         p1_shift: 64 - 8,
         p1,
         part_cap: lines / p1 + 16,
@@ -1115,6 +1258,11 @@ fn run() -> Res<()> {
     let campaigns = load_campaigns(&data.join("campaigns.csv"))?;
     let first_day = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - first_day + 1) as usize;
+    let base = ws - CLICK_REACH; // R17: the click window starts 7 days before the event window
+    if we - base > u32::MAX as i64 {
+        // Timestamps are kept as u32 ms offsets from `base`; the generator's windows are 14 days.
+        return Err("windows longer than 42 days are not supported".into());
+    }
 
     let mut paths: Vec<(Kind, PathBuf)> = Vec::new();
     for (kind, dir) in [(Kind::Link, "links"), (Kind::Event, "events"), (Kind::Click, "clicks")] {
@@ -1131,7 +1279,9 @@ fn run() -> Res<()> {
     let est_events = ev_bytes / 70 + 1;
     let p1 = (est_events / 16384).next_power_of_two().clamp(16, 4096);
     let p2 = p1;
-    let part_cap = est_events * 5 / 4 / (p1 * threads) + 16;
+    // Generous capacities: unused tails of huge-page-backed buffers are mostly never touched,
+    // and growing a Vec copies it.
+    let part_cap = est_events * 2 / (p1 * threads) + 16;
     log(&format!(
         "window [{ws}, {we}), {} files, {} tasks, {:.1} MB of events, {threads} threads, P1={p1}",
         files.len(),
@@ -1153,6 +1303,7 @@ fn run() -> Res<()> {
         campaigns: &campaigns,
         ws,
         we,
+        base,
         p1_shift: 64 - p1.trailing_zeros(),
         p1,
         part_cap,
@@ -1183,8 +1334,8 @@ fn run() -> Res<()> {
         p2,
         click_tasks,
         next: AtomicUsize::new(0),
-        ev_cap: copies * 5 / 4 / (p2 * threads) + 16,
-        ck_cap: clicks * 5 / 4 / (p2 * threads) + 16,
+        ev_cap: copies * 2 / (p2 * threads) + 16,
+        ck_cap: clicks * 2 / (p2 * threads) + 16,
     };
     let s2 = par(threads, |_| stage2_worker(&c2));
     let survivors: usize = s2.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
@@ -1204,6 +1355,7 @@ fn run() -> Res<()> {
         s2: &s2,
         names: &names,
         cat_rank: &products.rank,
+        base,
         first_day,
         ndays,
         organic: campaigns.ids.len(),
@@ -1246,4 +1398,235 @@ fn run() -> Res<()> {
     }
     log("done");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn chance(&mut self, pct: u64) -> bool {
+            self.below(100) < pct
+        }
+    }
+
+    fn catalogs() -> (Catalog, Campaigns) {
+        let mut names: Vec<Vec<u8>> = vec![b"books".to_vec(), b"shoes".to_vec(), b"unknown".to_vec()];
+        let mut lookup = Lookup::new(b"p");
+        for i in 1..200u32 {
+            lookup.insert_first(format!("p{i}").as_bytes(), i % 2);
+        }
+        lookup.insert_first(b"P7", 1);
+        names.truncate(3);
+        let cat = Catalog { lookup, names, rank: vec![0, 1, 2], unknown: 2 };
+        let mut camps = Campaigns { lookup: Lookup::new(b"c_"), ids: Vec::new(), channels: Vec::new() };
+        for i in 1..20u32 {
+            camps.lookup.insert_first(format!("c_{i}").as_bytes(), i - 1);
+            camps.ids.push(format!("c_{i}").into_bytes());
+            camps.channels.push(b"search".to_vec());
+        }
+        (cat, camps)
+    }
+
+    const WS: i64 = 1_791_590_400_000; // 2026-10-10T00:00:00Z
+    const WE: i64 = WS + 14 * DAY_MS;
+
+    fn utc(ms: i64) -> String {
+        let days = ms.div_euclid(DAY_MS);
+        let secs = ms.rem_euclid(DAY_MS) / 1000;
+        // civil_from_days (Hinnant)
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    }
+
+    fn id(r: &mut Rng, prefix: char) -> String {
+        const B36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let n = 1 + r.below(9) as usize;
+        let mut s: String = std::iter::once(prefix).chain((0..n).map(|_| B36[r.below(36) as usize] as char)).collect();
+        match r.below(40) {
+            0 => s = s.to_uppercase(),
+            1 => s = String::new(),
+            2 => s.push(' '),
+            3 => s.insert(0, ' '),
+            4 => s.push('_'),
+            5 => s.push_str("abcdefghij"),
+            6 => s.push('\r'),
+            _ => {}
+        }
+        s
+    }
+
+    fn ts(r: &mut Rng) -> String {
+        let t = WS - 3 * DAY_MS + r.below((20 * DAY_MS) as u64) as i64;
+        let t = if r.chance(70) { t - t.rem_euclid(1000) } else { t };
+        match r.below(16) {
+            0..=5 if t % 1000 == 0 => format!("{}Z", utc(t)),
+            6 | 7 if t % 1000 == 0 => {
+                let off = [-600i64, -240, 0, 60, 330, 720][r.below(6) as usize];
+                let local = t + off * 60_000;
+                format!("{}{}{:02}:{:02}", utc(local), if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60)
+            }
+            8 => format!("{:016}", t),
+            9 => format!("{}z", utc(t)),
+            10 => format!("{}.5", t),
+            11 => format!("{}", utc(t).replace('T', " ")),
+            12 => "2026-02-30T10:00:00Z".to_string(),
+            13 => "2026-10-12T10:00:00+0200".to_string(),
+            14 => String::new(),
+            _ => format!("{t}"),
+        }
+    }
+
+    fn quote(r: &mut Rng, s: String) -> String {
+        match r.below(30) {
+            0..=5 => format!("\"{s}\""),
+            6 => format!("\"{s}"),
+            7 => format!("{s}\""),
+            8 => format!("\"\"{s}\""),
+            _ => s,
+        }
+    }
+
+    fn event_lines(r: &mut Rng, n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let kind = ["view", "cart", "purchase", "Purchase", "cart ", ""][[0, 0, 0, 1, 1, 2, 2, 2, 3, 4, 5][r.below(11) as usize]];
+            let product = match r.below(12) {
+                0 => String::new(),
+                1 => "P7".to_string(),
+                2 => " p1".to_string(),
+                3 => "p0123".to_string(),
+                _ => format!("p{}", 1 + r.below(250)),
+            };
+            let price = match r.below(12) {
+                0 => String::new(),
+                1 => "0250".to_string(),
+                2 => "19.99".to_string(),
+                3 => "10000001".to_string(),
+                4 => "0".to_string(),
+                _ => format!("{}", 1 + r.below(50_000)),
+            };
+            let fields = [id(r, 'e'), id(r, 'u'), ts(r), ts(r), kind.to_string(), product, price];
+            let mut parts: Vec<String> = fields.into_iter().map(|f| quote(r, f)).collect();
+            match r.below(40) {
+                0 => {
+                    parts.pop();
+                }
+                1 => parts.push("x".to_string()),
+                2 => parts = vec![String::new()],
+                _ => {}
+            }
+            out.extend_from_slice(parts.join(",").as_bytes());
+            if r.chance(3) {
+                out.push(b'\r');
+            }
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn click_lines(r: &mut Rng, n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let camp = match r.below(10) {
+                0 => "C_3".to_string(),
+                1 => String::new(),
+                2 => "c_99".to_string(),
+                _ => format!("c_{}", 1 + r.below(19)),
+            };
+            let fields = [id(r, 'k'), id(r, 'u'), camp, ts(r)];
+            let mut parts: Vec<String> = fields.into_iter().map(|f| quote(r, f)).collect();
+            if r.chance(3) {
+                parts.push("x".to_string());
+            }
+            out.extend_from_slice(parts.join(",").as_bytes());
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn link_lines(r: &mut Rng, n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let mut parts: Vec<String> = [id(r, 'u'), id(r, 'u')].into_iter().map(|f| quote(r, f)).collect();
+            if r.chance(3) {
+                parts.pop();
+            }
+            out.extend_from_slice(parts.join(",").as_bytes());
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn ctx<'a>(cat: &'a Catalog, camps: &'a Campaigns, interner: &'a Interner) -> C1<'a> {
+        C1 {
+            files: &[],
+            tasks: &[],
+            next: AtomicUsize::new(0),
+            links_left: AtomicUsize::new(0),
+            link_pairs: Mutex::new(Vec::new()),
+            interner,
+            pmap: OnceLock::new(),
+            products: cat,
+            campaigns: camps,
+            ws: WS,
+            we: WE,
+            base: WS - CLICK_REACH,
+            p1_shift: 64 - 4,
+            p1: 16,
+            part_cap: 16,
+        }
+    }
+
+    /// Fast path + generic fallback == generic path alone, on randomized dirty input.
+    #[test]
+    fn fast_paths_match_generic_paths() {
+        let (cat, camps) = catalogs();
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        for round in 0..40 {
+            let ev = event_lines(&mut r, 2000);
+            let (i1, i2) = (Interner::default(), Interner::default());
+            let (c1, c2) = (ctx(&cat, &camps, &i1), ctx(&cat, &camps, &i2));
+            let mut a: Vec<Vec<Ev1>> = vec![Vec::new(); 16];
+            let mut b: Vec<Vec<Ev1>> = vec![Vec::new(); 16];
+            parse_events(&ev, &c1, &mut a);
+            slow_events(&ev, &c2, &mut b);
+            assert_eq!(a, b, "events, round {round}");
+            assert!(a.iter().map(|v| v.len()).sum::<usize>() > 500);
+
+            let ck = click_lines(&mut r, 2000);
+            let (i1, i2) = (Interner::default(), Interner::default());
+            let (c1, c2) = (ctx(&cat, &camps, &i1), ctx(&cat, &camps, &i2));
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            parse_clicks(&ck, &c1, &mut a);
+            slow_clicks(&ck, &c2, &mut b);
+            assert_eq!(a, b, "clicks, round {round}");
+
+            let lk = link_lines(&mut r, 2000);
+            let (i1, i2) = (Interner::default(), Interner::default());
+            let (c1, c2) = (ctx(&cat, &camps, &i1), ctx(&cat, &camps, &i2));
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            parse_links(&lk, &c1, &mut a);
+            slow_links(&lk, &c2, &mut b);
+            assert_eq!(a, b, "links, round {round}");
+        }
+    }
 }

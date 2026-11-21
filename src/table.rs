@@ -11,6 +11,18 @@ pub fn mix(mut k: u64) -> u64 {
     k
 }
 
+/// Hints the CPU to start loading the cache line holding `p`.
+#[inline(always)]
+pub fn prefetch<T>(p: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint; it never faults and `p` is a valid reference anyway.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 pub struct Map<V: Copy + Default> {
     slots: Vec<(u64, V)>,
     mask: usize,
@@ -94,6 +106,12 @@ impl<V: Copy + Default> Map<V> {
                 self.insert(k, v);
             }
         }
+    }
+
+    /// Starts loading the slot where a lookup of `k` begins.
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        prefetch(&self.slots[mix(k) as usize & self.mask]);
     }
 
     /// Empties the map, keeping capacity for at least `n` keys.

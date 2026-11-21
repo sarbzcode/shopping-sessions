@@ -413,7 +413,7 @@ fn byte(x: u64, i: u32) -> u32 {
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` (20 bytes) or F2 `YYYY-MM-DDTHH:MM:SS±HH:MM` (25 bytes).
 #[inline(always)]
-fn parse_civil(f: &[u8]) -> Option<i64> {
+pub fn parse_civil(f: &[u8]) -> Option<i64> {
     let n = f.len();
     let w0 = le64(&f[0..8]); // YYYY-MM-
     let w1 = le64(&f[8..16]); // DDTHH:MM
@@ -472,7 +472,7 @@ fn parse8(x: u64) -> u64 {
 
 /// F3 with exactly 13 characters (every epoch-ms value from 2001 to 2286): the common case.
 #[inline(always)]
-fn parse_f3_13(f: &[u8]) -> Option<i64> {
+pub fn parse_f3_13(f: &[u8]) -> Option<i64> {
     let a = le64(&f[0..8]) ^ ZEROS;
     let b = le64(&f[5..13]) ^ ZEROS;
     if !(digits_ok(a, u64::MAX) && digits_ok(b, u64::MAX)) {
