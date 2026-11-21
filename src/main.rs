@@ -1277,7 +1277,9 @@ fn run() -> Res<()> {
     tasks.sort_by_key(|t| (t.kind != Kind::Link, std::cmp::Reverse(t.end - t.start)));
     let ev_bytes: usize = tasks.iter().filter(|t| t.kind == Kind::Event).map(|t| t.end - t.start).sum();
     let est_events = ev_bytes / 70 + 1;
-    let p1 = (est_events / 16384).next_power_of_two().clamp(16, 4096);
+    // At most 1024 partitions: each thread keeps one buffer per partition and stage, and large
+    // buffers are separate mappings, so this keeps far below Linux's 65530-mapping limit.
+    let p1 = (est_events / 16384).next_power_of_two().clamp(16, 1024);
     let p2 = p1;
     // Generous capacities: unused tails of huge-page-backed buffers are mostly never touched,
     // and growing a Vec copies it.
