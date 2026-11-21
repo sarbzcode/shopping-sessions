@@ -52,6 +52,17 @@ impl Prof {
     }
 }
 
+/// (user, system) CPU seconds of this process so far, from /proc (Linux only).
+fn cpu_seconds() -> Option<(f64, f64)> {
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = &s[s.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // fields after "(comm) ": state is field 3, utime field 14, stime field 15 (clock ticks)
+    let ut: f64 = f.get(11)?.parse().ok()?;
+    let st: f64 = f.get(12)?.parse().ok()?;
+    Some((ut / 100.0, st / 100.0))
+}
+
 fn report(stage: &str, labels: &[&str], profs: &[&Prof]) {
     if std::env::var("SS_PROFILE").is_err() {
         return;
@@ -85,7 +96,7 @@ type Res<T> = Result<T, String>;
 
 /// One parsed copy of an event (before dedup). `ukey != 0` means this copy is valid (R24, R25):
 /// a valid copy always has a non-empty user_id, and no ID key is 0.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[repr(C)]
 struct Ev1 {
     ekey: u64,
@@ -582,50 +593,57 @@ fn stage1_worker(c: &C1) -> S1 {
 // Stage 2: dedup, person mapping, scatter by person
 // ---------------------------------------------------------------------------------------------
 
-/// Per-partition dedup table holding each event_id's best copy so far.
+/// Per-partition dedup: a compact open-addressing table event_id -> index into `winners`, the
+/// dense array of each event_id's best copy so far (in first-seen order).
 struct Dedup {
-    slots: Vec<Ev1>,
-    used: Vec<u32>,
+    keys: Vec<u64>,
+    idx: Vec<u32>,
     mask: usize,
+    winners: Vec<Ev1>,
+    used: Vec<u32>,
 }
 
-const EMPTY_EV1: Ev1 = Ev1 { ekey: 0, ingest: 0, ukey: 0, ts: 0, pc: 0 };
 const AHEAD: usize = 8; // prefetch distance for random probes
 
 impl Dedup {
     fn new() -> Self {
-        Self { slots: Vec::new(), used: Vec::new(), mask: 0 }
+        Self { keys: Vec::new(), idx: Vec::new(), mask: 0, winners: Vec::new(), used: Vec::new() }
     }
     fn reset(&mut self, n: usize) {
         let cap = (n.max(8) * 2).next_power_of_two();
-        if cap > self.slots.len() {
-            self.slots = vec![EMPTY_EV1; cap];
+        if cap > self.keys.len() {
+            self.keys = vec![0; cap];
+            self.idx = vec![0; cap];
             self.mask = cap - 1;
         } else {
             for &i in &self.used {
-                self.slots[i as usize].ekey = 0;
+                self.keys[i as usize] = 0;
             }
         }
         self.used.clear();
+        self.winners.clear();
     }
     #[inline(always)]
     fn prefetch(&self, ekey: u64) {
-        table::prefetch(&self.slots[mix(ekey) as usize & self.mask]);
+        table::prefetch(&self.keys[mix(ekey) as usize & self.mask]);
     }
     /// R23: keep the copy with the smallest ingest_ts (equal ones are identical copies).
     #[inline(always)]
     fn offer(&mut self, r: &Ev1) {
         let mut i = mix(r.ekey) as usize & self.mask;
         loop {
-            let s = &mut self.slots[i];
-            if s.ekey == 0 {
-                *s = *r;
+            let k = self.keys[i];
+            if k == 0 {
+                self.keys[i] = r.ekey;
+                self.idx[i] = self.winners.len() as u32;
+                self.winners.push(*r);
                 self.used.push(i as u32);
                 return;
             }
-            if s.ekey == r.ekey {
-                if r.ingest < s.ingest {
-                    *s = *r;
+            if k == r.ekey {
+                let w = &mut self.winners[self.idx[i] as usize];
+                if r.ingest < w.ingest {
+                    *w = *r;
                 }
                 return;
             }
@@ -659,12 +677,10 @@ fn person_of(pmap: &Map<u64>, ukey: u64) -> u64 {
 
 fn stage2_worker(c: &C2) -> S2 {
     let t_alloc = Instant::now();
-    let mut out = S2 {
-        ev: (0..c.p2).map(|_| Vec::with_capacity(c.ev_cap)).collect(),
-        ck: (0..c.p2).map(|_| Vec::with_capacity(c.ck_cap)).collect(),
-        prof: Prof::default(),
-    };
-    out.prof.add(3, t_alloc);
+    let mut prof = Prof::default();
+    let mut ev_out: Vec<Vec<Ev2>> = (0..c.p2).map(|_| Vec::with_capacity(c.ev_cap)).collect();
+    let mut ck_out: Vec<Vec<Ck>> = (0..c.p2).map(|_| Vec::with_capacity(c.ck_cap)).collect();
+    prof.add(3, t_alloc);
     let mut dedup = Dedup::new();
     loop {
         let i = c.next.fetch_add(1, Relaxed);
@@ -682,25 +698,25 @@ fn stage2_worker(c: &C2) -> S2 {
                     dedup.offer(r);
                 }
             }
-            out.prof.add(0, t_dedup);
+            prof.add(0, t_dedup);
             let t_emit = Instant::now();
-            // Scan the table in slot order (sequential memory), prefetching person-map probes.
-            let slots = &dedup.slots[..];
-            for (k, rec) in slots.iter().enumerate() {
-                if let Some(ahead) = slots.get(k + 2 * AHEAD) {
+            // The winners are dense and sequential; prefetch the person-map probes ahead.
+            let winners = &dedup.winners[..];
+            for (k, rec) in winners.iter().enumerate() {
+                if let Some(ahead) = winners.get(k + 2 * AHEAD) {
                     if ahead.ukey != 0 {
                         c.pmap.prefetch(ahead.ukey);
                     }
                 }
-                // Empty slots have ekey 0; R23: an invalid kept copy (ukey 0) drops the event.
-                if rec.ekey == 0 || rec.ukey == 0 {
+                // R23: an invalid kept copy (ukey 0) drops the event.
+                if rec.ukey == 0 {
                     continue;
                 }
                 let person = person_of(c.pmap, rec.ukey);
                 let q = (mix(person) >> c.p2_shift) as usize;
-                out.ev[q].push(Ev2 { person, ts: rec.ts, pc: rec.pc });
+                ev_out[q].push(Ev2 { person, ts: rec.ts, pc: rec.pc });
             }
-            out.prof.add(1, t_emit);
+            prof.add(1, t_emit);
         } else if let Some(&(t, s, e)) = c.click_tasks.get(i - c.p1) {
             let t_ck = Instant::now();
             let cks = &c.s1[t].ck[s..e];
@@ -710,14 +726,14 @@ fn stage2_worker(c: &C2) -> S2 {
                 }
                 let person = person_of(c.pmap, ck.key);
                 let q = (mix(person) >> c.p2_shift) as usize;
-                out.ck[q].push(Ck { key: person, ..*ck });
+                ck_out[q].push(Ck { key: person, ..*ck });
             }
-            out.prof.add(2, t_ck);
+            prof.add(2, t_ck);
         } else {
             break;
         }
     }
-    out
+    S2 { ev: ev_out, ck: ck_out, prof }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1277,10 +1293,16 @@ fn run() -> Res<()> {
     tasks.sort_by_key(|t| (t.kind != Kind::Link, std::cmp::Reverse(t.end - t.start)));
     let ev_bytes: usize = tasks.iter().filter(|t| t.kind == Kind::Event).map(|t| t.end - t.start).sum();
     let est_events = ev_bytes / 70 + 1;
-    // At most 1024 partitions: each thread keeps one buffer per partition and stage, and large
-    // buffers are separate mappings, so this keeps far below Linux's 65530-mapping limit.
-    let p1 = (est_events / 16384).next_power_of_two().clamp(16, 1024);
-    let p2 = p1;
+    // Partition counts trade scatter fan-out (fewer write streams per thread is faster) against
+    // dedup table size (fewer partitions means bigger tables). Measured on 5M and 20M events:
+    // ~128k event copies per dedup partition and 128 person partitions were best (about 20% less
+    // CPU than 1024/1024). Small counts also keep the buffers far below Linux's mapping limit.
+    let p1 = (est_events / 131_072).next_power_of_two().clamp(64, 512);
+    let p2 = 128;
+    // Development overrides (powers of two) for partition experiments.
+    let pow2_env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| v.is_power_of_two());
+    let p1 = pow2_env("SS_P1").unwrap_or(p1);
+    let p2 = pow2_env("SS_P2").unwrap_or(p2);
     // Generous capacities: unused tails of huge-page-backed buffers are mostly never touched,
     // and growing a Vec copies it.
     let part_cap = est_events * 2 / (p1 * threads) + 16;
@@ -1398,7 +1420,10 @@ fn run() -> Res<()> {
     for r in results {
         r?;
     }
-    log("done");
+    match cpu_seconds() {
+        Some((u, s)) => log(&format!("done (cpu user {u:.2} s, sys {s:.2} s)")),
+        None => log("done"),
+    }
     Ok(())
 }
 
