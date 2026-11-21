@@ -1,0 +1,16 @@
+# Fixtures are byte-exact test data (E20 has deliberate \r\n lines): never convert line endings.
+fixtures/** -text
+*.csv -text
+# Everything that runs in a Linux container keeps LF endings on every checkout.
+*.sh text eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+Dockerfile* text eol=lf
+Makefile text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

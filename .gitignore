@@ -1,0 +1,16 @@
+# Data, answers and outputs must never be committed (public repo, "no data checked in").
+*.zip
+_ref/
+dev/
+dev-answer/
+data/
+datasets/
+out/
+out-*/
+scratch/
+*.parquet
+
+# Build and tool outputs
+target/
+__pycache__/
+*.pyc
