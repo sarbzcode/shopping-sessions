@@ -7,12 +7,11 @@ The submitted image (`Dockerfile`) is a single static Rust binary on an empty (`
 ## Approach (native binary, `src/`)
 
 1. **Read.** Every input file is memory-mapped and cut into ~2 MB chunks on line boundaries. Chunks go to all cores through an atomic work queue, link files first.
-2. **Parse.** One pass per chunk computes 64-byte bitmasks of commas, quotes and newlines with SSE2. Each line then gets a 128-bit window of its own bits:
-   - a popcount checks the field count;
-   - quotes are validated without branching on the bit positions (every quote must be one of a pair wrapping a whole field);
-   - fields are parsed straight from bytes: SWAR digit checks for `YYYY-MM-DDTHH:MM:SS` and offsets, and an 8-digits-per-multiply path for epoch milliseconds.
+2. **Parse.** A fast path (`src/fast.rs`) walks each line field by field in the expected shape:
+   - IDs are packed into order-preserving 64-bit keys while scanning (6 bits per character, so numeric order equals byte order);
+   - timestamps are parsed at fixed offsets with SWAR digit checks (`YYYY-MM-DDTHH:MM:SS`, offsets, 8-digits-per-multiply epoch milliseconds).
 
-   IDs are packed into order-preserving 64-bit keys (6 bits per character, so numeric order equals byte order), with an interner fallback for anything else. Nothing is normalized.
+   Any line not exactly in that shape (a stray quote, an extra field, a bad timestamp, an ID that does not pack) bails to the generic splitter, which implements the dialect byte by byte, so the fast path cannot change a result. A randomized test checks this on 240,000 dirty lines. Records are compact: 32 bytes per event copy, with timestamps as 32-bit offsets. Nothing is normalized.
 3. **Linked IDs.** The thread that finishes the last links chunk runs a union-find (path halving, union by size) while the others keep parsing. Each person is named by the byte-wise smallest of their IDs, including IDs that appear only in links. Shared devices need no special case: they are just IDs that link many people.
 4. **Dedup.** Event copies are partitioned by an `event_id` hash. Each partition keeps the earliest-ingested copy (before validation), maps it to its person, and re-partitions survivors by a person hash. The dedup must be global because some duplicate copies name a different user.
 5. **Sessions and attribution.** Per person, events are sorted by time and split on gaps over 30 minutes. The person's clicks are sorted by time and `click_id`. A sliding 7-day window gives each session its credit (latest click, then smallest `click_id`) and its set of assisting campaigns, with per-campaign counts.
