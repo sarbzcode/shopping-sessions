@@ -218,25 +218,26 @@ fn load_products(path: &Path) -> Res<Catalog> {
     let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut names: Vec<Vec<u8>> = Vec::new();
     let mut index: HashMap<Vec<u8>, u16> = HashMap::new();
+    // Allocates only for a new category name (the file has ~20), not per line.
     let mut intern = |b: &[u8], names: &mut Vec<Vec<u8>>| -> u16 {
-        *index.entry(b.to_vec()).or_insert_with(|| {
-            names.push(b.to_vec());
-            (names.len() - 1) as u16
-        })
+        if let Some(&i) = index.get(b) {
+            return i;
+        }
+        names.push(b.to_vec());
+        let i = (names.len() - 1) as u16;
+        index.insert(b.to_vec(), i);
+        i
     };
+    // A missing category (and any product not in the file) is `unknown` (R28); interning it
+    // first also merges it with a category of that name, as the reference does.
+    let unknown = intern(b"unknown", &mut names);
     let mut lookup = Lookup::new(b"p");
-    let mut pending: Vec<(Vec<u8>, Option<u16>)> = Vec::new();
     for_each_line::<2>(&data[body(&data)..], |f| {
         if !f[0].is_empty() {
-            let cat = if f[1].is_empty() { None } else { Some(intern(f[1], &mut names)) };
-            pending.push((f[0].to_vec(), cat));
+            let cat = if f[1].is_empty() { unknown } else { intern(f[1], &mut names) };
+            lookup.insert_first(f[0], cat as u32);
         }
     });
-    // A missing category (and any product not in the file) is `unknown` (R28).
-    let unknown = intern(b"unknown", &mut names);
-    for (pid, cat) in pending {
-        lookup.insert_first(&pid, cat.unwrap_or(unknown) as u32);
-    }
     if names.len() > 256 {
         // Records keep a category in 8 bits; the generator writes 20 categories.
         return Err(format!("{} categories in products.csv; at most 255 plus `unknown` are supported", names.len() - 1));
@@ -786,6 +787,8 @@ struct C3<'a> {
     organic: usize, // campaign index of `organic` (= number of campaigns)
     order: Vec<usize>,
     next: AtomicUsize,
+    ud_dir: &'a Path,
+    products: &'a Catalog,
 }
 
 struct Agg {
@@ -870,8 +873,14 @@ fn flush_day(rows: &mut Vec<UdRow>, person: u64, day: i64, sessions: u32, events
 fn process_person(person: u64, ev: &mut [Ev2], ck: &mut [Ck], c: &C3, w: &mut W3) {
     ev.sort_unstable_by_key(|e| e.ts);
     if ck.len() > 1 {
+        // R32 tie-break order: ts, then click_id byte-wise. Without interned keys, numeric order
+        // of packed keys is byte order, so a plain tuple sort does it.
         let names = c.names;
-        ck.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| names.cmp(a.ckey, b.ckey)));
+        if names.any_fallback() {
+            ck.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| names.cmp(a.ckey, b.ckey)));
+        } else {
+            ck.sort_unstable_by_key(|x| (x.ts, x.ckey));
+        }
     }
     let nd = c.ndays;
     let (mut lo, mut hi) = (0usize, 0usize);
@@ -1048,7 +1057,7 @@ fn stage3_partition(q: usize, c: &C3, w: &mut W3) {
     w.cks = cks;
 }
 
-fn stage3_worker(c: &C3, ncamp_total: usize) -> W3 {
+fn stage3_worker(c: &C3, ncamp_total: usize, t: usize) -> (W3, Res<()>) {
     let mut w = W3 {
         prof: Prof::default(),
         rows: Vec::new(),
@@ -1068,7 +1077,13 @@ fn stage3_worker(c: &C3, ncamp_total: usize) -> W3 {
         let Some(&q) = c.order.get(i) else { break };
         stage3_partition(q, c, &mut w);
     }
-    w
+    // Write this thread's user_daily rows now, while other threads may still be working.
+    let res = if w.rows.is_empty() {
+        Ok(())
+    } else {
+        write_user_daily(&c.ud_dir.join(format!("part-{t:05}.parquet")), &w.rows, c.names, c.products)
+    };
+    (w, res)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1404,7 +1419,11 @@ fn run() -> Res<()> {
     drop(s1);
     log("stage 1 memory freed");
 
-    // Stage 3
+    // Stage 3 (each worker also writes its own user_daily file when it is done)
+    let ud_dir = out.join("user_daily");
+    let cd_dir = out.join("campaign_daily");
+    fs::create_dir_all(&ud_dir).map_err(|e| format!("{}: {e}", ud_dir.display()))?;
+    fs::create_dir_all(&cd_dir).map_err(|e| format!("{}: {e}", cd_dir.display()))?;
     let names = interner.freeze();
     let mut order: Vec<usize> = (0..p2).collect();
     let weight = |q: usize| -> usize { s2.iter().map(|s| s.ev[q].len() + s.ck[q].len()).sum() };
@@ -1421,41 +1440,33 @@ fn run() -> Res<()> {
         organic: campaigns.ids.len(),
         order,
         next: AtomicUsize::new(0),
+        ud_dir: &ud_dir,
+        products: &products,
     };
-    let mut w3 = par(threads, |_| stage3_worker(&c3, ncamp_total));
-    let user_rows: usize = w3.iter().map(|w| w.rows.len()).sum();
-    log(&format!("stage 3: {user_rows} user_daily rows"));
-    report("stage3", &["group", "sessions+attrib"], &w3.iter().map(|w| &w.prof).collect::<Vec<_>>());
-    drop(s2);
-    log("stage 2 memory freed");
+    let w3 = par(threads, |t| stage3_worker(&c3, ncamp_total, t));
+    let user_rows: usize = w3.iter().map(|(w, _)| w.rows.len()).sum();
+    log(&format!("stage 3: {user_rows} user_daily rows (written)"));
+    report("stage3", &["group", "sessions+attrib"], &w3.iter().map(|(w, _)| &w.prof).collect::<Vec<_>>());
 
-    // Stage 4
-    let ud_dir = out.join("user_daily");
-    let cd_dir = out.join("campaign_daily");
-    fs::create_dir_all(&ud_dir).map_err(|e| format!("{}: {e}", ud_dir.display()))?;
-    fs::create_dir_all(&cd_dir).map_err(|e| format!("{}: {e}", cd_dir.display()))?;
+    // Stage 4: campaign_daily from the merged per-thread counters (R39)
     let mut agg = Agg::new(ncamp_total * ndays);
-    for w in &w3 {
+    for (w, res) in &w3 {
+        if let Err(e) = res {
+            return Err(e.clone());
+        }
         for (dst, src) in [(&mut agg.sess, &w.agg.sess), (&mut agg.purch, &w.agg.purch), (&mut agg.rev, &w.agg.rev), (&mut agg.assist, &w.agg.assist)] {
             dst.iter_mut().zip(src).for_each(|(a, b)| *a += b);
         }
     }
-    let row_sets: Vec<Vec<UdRow>> = w3.iter_mut().map(|w| std::mem::take(&mut w.rows)).collect();
-    let results = par(threads, |t| -> Res<()> {
-        if let Some(rows) = row_sets.get(t) {
-            if !rows.is_empty() || (t == 0 && user_rows == 0) {
-                write_user_daily(&ud_dir.join(format!("part-{t:05}.parquet")), rows, &names, &products)?;
-            }
-        }
-        if t == 0 {
-            let n = write_campaign_daily(&cd_dir.join("part-00000.parquet"), &agg, &campaigns, first_day, ndays)?;
-            log(&format!("campaign_daily: {n} rows"));
-        }
-        Ok(())
-    });
-    for r in results {
-        r?;
+    if user_rows == 0 {
+        // R37: the table still needs one Parquet file, with zero rows.
+        write_user_daily(&ud_dir.join("part-00000.parquet"), &[], &names, &products)?;
     }
+    let n = write_campaign_daily(&cd_dir.join("part-00000.parquet"), &agg, &campaigns, first_day, ndays)?;
+    log(&format!("campaign_daily: {n} rows"));
+    // The process exits next; let the OS reclaim the big buffers instead of freeing them here.
+    std::mem::forget(w3);
+    std::mem::forget(s2);
     match cpu_seconds() {
         Some((u, s)) => log(&format!("done (cpu user {u:.2} s, sys {s:.2} s)")),
         None => log("done"),

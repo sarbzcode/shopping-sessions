@@ -147,6 +147,11 @@ pub struct Names {
 }
 
 impl Names {
+    /// Whether any fallback (interned) key exists; if not, every key compares numerically.
+    pub fn any_fallback(&self) -> bool {
+        !self.inner.strings.is_empty()
+    }
+
     #[inline]
     pub fn write(&self, k: u64, out: &mut Vec<u8>) {
         self.inner.write(k, out)
