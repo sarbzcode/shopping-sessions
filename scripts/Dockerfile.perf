@@ -1,0 +1,9 @@
+# Profiling image (development only): the Rust toolchain, perf, and a release build with symbols.
+# docker buildx build -f scripts/Dockerfile.perf --load -t ss-perf .
+FROM rust:1.93-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends linux-perf && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1
+RUN cargo build --release && cp target/release/shopping-sessions /usr/local/bin/ss

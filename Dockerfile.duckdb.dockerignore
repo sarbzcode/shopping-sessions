@@ -1,0 +1,5 @@
+# Whitelist for Dockerfile.duckdb.
+**
+!requirements.txt
+!run.sh
+!pipeline/**

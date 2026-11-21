@@ -1,5 +1,5 @@
-# Whitelist: only what the image needs. Keeps data, answers and build output out of the context.
+# Whitelist: only what the native build needs. Keeps data, answers and build output out of the context.
 **
-!requirements.txt
-!run.sh
-!pipeline/**
+!Cargo.toml
+!Cargo.lock
+!src/**
