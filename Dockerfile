@@ -1,9 +1,11 @@
 # Shopping Sessions: one static native binary on an empty image.
-# Scorers are linux/amd64 Intel Xeon (Cascade Lake or newer); x86-64-v2 keeps the binary runnable on
-# any x86-64 machine from the last decade, including the dev laptop it is tested on.
+# Scorers are linux/amd64 Intel Xeon, Cascade Lake or newer. The default target, x86-64-v2, is the
+# one every test runs (the dev machine has no AVX2). An AVX2 build for the scorer:
+#   docker buildx build --build-arg TARGET_CPU=x86-64-v3 ...
 FROM rust:1.93-slim-bookworm AS build
+ARG TARGET_CPU=x86-64-v2
 WORKDIR /src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static" \
+ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU} -C target-feature=+crt-static" \
     CARGO_TARGET=x86_64-unknown-linux-gnu
 # Dependencies first, so source edits do not rebuild them.
 COPY Cargo.toml Cargo.lock ./
